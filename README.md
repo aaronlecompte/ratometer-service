@@ -22,4 +22,4 @@ There are two components included in this service:
 
  ## License 
 
- 
+ MIT Licence
