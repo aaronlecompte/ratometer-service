@@ -4,6 +4,7 @@ import os
 import time
 from datetime import datetime
 from dotenv import load_dotenv
+import simplejson
 
 
 from pyathena import connect
@@ -61,6 +62,8 @@ def perform_transforms():
         FROM ratometer.transitions
         WHERE status = 'NO_STOCK'
         and prev_status IN ('IN_STOCK', 'LOW_STOCK')
+        AND from_iso8601_timestamp(date) >= CURRENT_TIMESTAMP - INTERVAL '72' hour
+        AND from_iso8601_timestamp(date) < CURRENT_TIMESTAMP
         GROUP BY 1),
 
         restock_dates AS (
@@ -70,6 +73,8 @@ def perform_transforms():
         FROM ratometer.transitions
         WHERE status IN ('IN_STOCK', 'LOW_STOCK')
         and prev_status = 'NO_STOCK'
+        AND from_iso8601_timestamp(date) >= CURRENT_TIMESTAMP - INTERVAL '72' hour
+        AND from_iso8601_timestamp(date) < CURRENT_TIMESTAMP
         GROUP BY 1),
 
         latest_status AS (SELECT * FROM (
@@ -80,6 +85,8 @@ def perform_transforms():
         status,
         ROW_NUMBER() OVER (PARTITION BY address ORDER BY date DESC) as rn
         FROM ratometer.ratdata
+        WHERE from_iso8601_timestamp(date) >= CURRENT_TIMESTAMP - INTERVAL '72' hour
+        AND from_iso8601_timestamp(date) < CURRENT_TIMESTAMP
         ) t WHERE t.rn = 1),
 
         location_data AS (
@@ -140,6 +147,9 @@ def perform_transforms():
         """)
 
 def get_summary_data():
+
+    query_time = datetime.now().isoformat()
+
     print('Executing query')
     results = cursor_default.execute("""
         SELECT
@@ -159,18 +169,42 @@ def get_summary_data():
         ORDER BY 1, 2
     """)
 
+    
     print('Formatting results')
     df = pd.DataFrame(results)
-    df['query_time'] = datetime.now().isoformat()
+    df['query_time'] = query_time
 
-    filename_output = f"results_{datetime.now().strftime('%Y%m%d%H00')}.json"
+    summary = df.to_dict(orient='records')
+    
+    results_hours = cursor_default.execute("""
+        SELECT 
+        HOUR(from_iso8601_timestamp(date) at time zone 'Australia/Melbourne') as date_hour,
+        COUNT(*) as num_events
+        FROM ratometer.transitions 
+        WHERE from_iso8601_timestamp(date) >= CURRENT_TIMESTAMP - INTERVAL '72' hour
+        AND from_iso8601_timestamp(date) < CURRENT_TIMESTAMP
+        AND status = 'IN_STOCK'
+        and prev_status = 'NO_STOCK'
+        GROUP BY 1
+        ORDER BY 1
+    """)
+    
+    df_stock_hours = pd.DataFrame(results_hours)
+    df_stock_hours['query_time'] = query_time
 
-    df.to_json(filename_output, orient='records')
+    stock_hours = df_stock_hours.to_dict(orient='records')
 
     print('Uploading to S3')
+    filename_output = f"results_v2_{datetime.now().strftime('%Y%m%d%H00')}.json"
+    with open(filename_output, 'w') as fp:
+        simplejson.dump({
+            'summary': summary,
+            'stock_hours': stock_hours
+        }, fp, ignore_nan=True)
+
     s3 = boto3.resource('s3')
     s3.Bucket(S3_BUCKET_PUBLIC).upload_file(filename_output, f'data/{filename_output}')
-    s3.Bucket(S3_BUCKET_PUBLIC).upload_file(filename_output, f'data/latest.json')
+    s3.Bucket(S3_BUCKET_PUBLIC).upload_file(filename_output, f'data/latest_v2.json')
 
 if __name__ == '__main__':
     perform_transforms()
